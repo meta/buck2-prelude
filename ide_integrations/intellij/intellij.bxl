@@ -94,7 +94,7 @@ def _generate_impl(ctx: bxl.Context) -> None:
             modules[output.full_library] = _module_name(node.label)
 
     sdk_jars = []
-    for node, providers in candidates:
+    for node, _ in candidates:
         toolchain = node.resolved_attrs_lazy(ctx).get("_android_toolchain")
         if toolchain and AndroidToolchainInfo in toolchain:
             sdk_jars = toolchain[AndroidToolchainInfo].android_bootclasspath
