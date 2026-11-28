@@ -25,6 +25,7 @@ import org.jetbrains.kotlin.fir.declarations.FirFunction
 import org.jetbrains.kotlin.fir.declarations.FirProperty
 import org.jetbrains.kotlin.fir.declarations.FirRegularClass
 import org.jetbrains.kotlin.fir.declarations.FirResolvePhase
+import org.jetbrains.kotlin.fir.declarations.utils.effectiveVisibility
 import org.jetbrains.kotlin.fir.declarations.utils.isInline
 import org.jetbrains.kotlin.fir.expressions.FirBlock
 import org.jetbrains.kotlin.fir.expressions.builder.buildEmptyExpressionBlock
@@ -33,6 +34,7 @@ import org.jetbrains.kotlin.fir.resolve.ScopeSession
 import org.jetbrains.kotlin.fir.resolve.transformers.FirGlobalResolveProcessor
 import org.jetbrains.kotlin.fir.resolve.transformers.FirTransformerBasedResolveProcessor
 import org.jetbrains.kotlin.fir.resolve.transformers.createAllCompilerResolveProcessors
+import org.jetbrains.kotlin.fir.symbols.impl.FirNamedFunctionSymbol
 import org.jetbrains.kotlin.fir.types.hasResolvedType
 import org.jetbrains.kotlin.fir.visitors.FirVisitorVoid
 import org.jetbrains.kotlin.fir.withFileAnalysisExceptionWrapping
@@ -50,9 +52,11 @@ import org.jetbrains.kotlin.fir.withFileAnalysisExceptionWrapping
  * signature, an implicit return type (whose body that phase resolves), a const initializer,
  * contracts and header annotation arguments. After them, only the bodies of inline functions and
  * inline accessors are still read ([InlineBodyStage] keeps some of them), so those are left alone,
- * as is every body that is already resolved. Property initializers, delegated properties (with
- * their accessors), accessors that use `field`, and default values keep their normal resolution.
- * Local declarations live inside bodies and are not visited.
+ * as is every body that is already resolved. A non-inline function with a later same-named inline
+ * candidate also keeps its body: the numbering check reads its calls (transitively inlined shapes),
+ * and the resolution cost is one body per overload set. Property initializers, delegated properties
+ * (with their accessors), accessors that use `field`, and default values keep their normal
+ * resolution. Local declarations live inside bodies and are not visited.
  *
  * Compose ABI emulation is the exception: the applier inference reads composable bodies, so callers
  * leave skipping off while `ENABLE_COMPOSE_ABI_EMULATION` is set.
@@ -84,10 +88,16 @@ internal fun FirSession.runResolutionSkippingNonAbiBodies(
 }
 
 private fun emptyNonAbiBodies(declarations: List<FirDeclaration>) {
-  for (declaration in declarations) {
+  for ((index, declaration) in declarations.withIndex()) {
     when (declaration) {
       is FirRegularClass -> emptyNonAbiBodies(declaration.declarations)
-      is FirFunction -> if (!declaration.isInline) declaration.emptyUnresolvedBody()
+      is FirFunction ->
+          if (
+              !declaration.isInline &&
+                  !hasLaterSameNamedInlineCandidate(declarations, index, declaration)
+          ) {
+            declaration.emptyUnresolvedBody()
+          }
       is FirProperty ->
           // A delegated property's accessors call `getValue`/`setValue`, and body resolution
           // infers the delegate's type from those calls, so they keep their bodies. So do the
@@ -110,6 +120,31 @@ private fun emptyNonAbiBodies(declarations: List<FirDeclaration>) {
       else -> {}
     }
   }
+}
+
+/**
+ * Whether emptying [declaration]'s body would blind a later keepability check: a later
+ * same-container declaration with the same name is an inline keepability candidate, whose local
+ * class numbering depends on the calls this body makes (see InlineBodyKeepability).
+ */
+private fun hasLaterSameNamedInlineCandidate(
+    declarations: List<FirDeclaration>,
+    index: Int,
+    declaration: FirFunction,
+): Boolean {
+  val name = (declaration.symbol as? FirNamedFunctionSymbol)?.name ?: return false
+  for (i in index + 1 until declarations.size) {
+    val later = declarations[i]
+    if (
+        later is FirFunction &&
+            (later.symbol as? FirNamedFunctionSymbol)?.name == name &&
+            later.isInline &&
+            !later.effectiveVisibility.privateApi
+    ) {
+      return true
+    }
+  }
+  return false
 }
 
 private fun FirFunction.emptyUnresolvedBody() {

@@ -1327,13 +1327,29 @@ internal class IrSanitizerStage(
 internal class BytecodeSanitizerStage(preserveDeclarationOrder: Boolean = true) : AbiGenStage {
   override val name = "BytecodeSanitizer"
 
+  private val donorStubber = NumberingDonorStubber()
+
   private val transformers = listOfNotNull(
       ThrowsAnnotationStripper(),
       PrivateMetadataStripper(),
       SuspendInlineDispatchStubber(),
       StubLineNumberStripper(),
+      donorStubber,
       JvmAbiGenMemberSorter().takeUnless { preserveDeclarationOrder },
   )
+
+  /**
+   * Donor methods InlineBodyStage lowered real for their numbering side effect, stubbed here once
+   * codegen ran. Assigned before [transform]; empty by default, which changes nothing.
+   */
+  var numberingDonors: Set<DonorMethod> = emptySet()
+    set(value) {
+      field = value
+      donorStubber.donors = value
+    }
+
+  /** Recorded donors no class file matched: their real bodies would ship silently. */
+  fun unmatchedDonors(): Set<DonorMethod> = donorStubber.unmatched()
 
   /** Transform class bytecode in-memory, applying all sanitization transformers. */
   fun transform(bytes: ByteArray): ByteArray {

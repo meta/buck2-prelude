@@ -39,6 +39,7 @@ import org.jetbrains.kotlin.fir.declarations.utils.effectiveVisibility
 import org.jetbrains.kotlin.fir.declarations.utils.isConst
 import org.jetbrains.kotlin.fir.declarations.utils.isInline
 import org.jetbrains.kotlin.fir.declarations.utils.isInlineOrValue
+import org.jetbrains.kotlin.fir.declarations.utils.isSuspend
 import org.jetbrains.kotlin.fir.expressions.FirAnnotation
 import org.jetbrains.kotlin.fir.expressions.FirAnonymousFunctionExpression
 import org.jetbrains.kotlin.fir.expressions.FirCallableReferenceAccess
@@ -48,6 +49,7 @@ import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
 import org.jetbrains.kotlin.fir.expressions.FirGetClassCall
 import org.jetbrains.kotlin.fir.expressions.FirLiteralExpression
 import org.jetbrains.kotlin.fir.expressions.FirNamedArgumentExpression
+import org.jetbrains.kotlin.fir.expressions.FirPropertyAccessExpression
 import org.jetbrains.kotlin.fir.expressions.FirQualifiedAccessExpression
 import org.jetbrains.kotlin.fir.expressions.FirResolvable
 import org.jetbrains.kotlin.fir.expressions.FirResolvedQualifier
@@ -84,8 +86,10 @@ import org.jetbrains.kotlin.fir.types.ConeStarProjection
 import org.jetbrains.kotlin.fir.types.ConeTypeParameterType
 import org.jetbrains.kotlin.fir.types.FirErrorTypeRef
 import org.jetbrains.kotlin.fir.types.FirResolvedTypeRef
+import org.jetbrains.kotlin.fir.types.ProjectionKind
 import org.jetbrains.kotlin.fir.types.coneType
 import org.jetbrains.kotlin.fir.types.customAnnotations
+import org.jetbrains.kotlin.fir.types.isMarkedNullable
 import org.jetbrains.kotlin.fir.types.resolvedType
 import org.jetbrains.kotlin.fir.unwrapFakeOverrides
 import org.jetbrains.kotlin.fir.visitors.FirVisitorVoid
@@ -221,7 +225,9 @@ class InlineBodyKeepability(
    * same container therefore takes the first numbers; its body reaches the ABI only when it is a
    * kept inline function, so otherwise the kept body's classes would be numbered from 1 instead of
    * matching the classes its callers' full compile names. A body without classes of its own (see
-   * [hasOwnLocalClasses]) names no numbered class, so nothing before it matters.
+   * [hasOwnLocalClasses]) names no numbered class, so nothing before it matters. Shapes living in a
+   * called inline body are invisible here; [transitiveNumberingDonors] finds them for the IR-time
+   * reconstruct-or-reject decision instead of rejecting eagerly.
    */
   private fun localClassNumberingRejectReason(function: FirFunction): String? {
     val name = (function.symbol as? FirNamedFunctionSymbol)?.name ?: return null
@@ -234,19 +240,638 @@ class InlineBodyKeepability(
             is FirProperty -> declaration.name == name
             else -> false
           }
-      if (!sameName || !hasLocalClassShapes(declaration)) continue
+      if (!sameName) continue
       if (declaration is FirFunction && declaration.isInline && isKeepable(declaration)) continue
-      return "not lowerable: an earlier `$name` takes the first numbers of its local classes"
+      if (hasLocalClassShapes(declaration))
+          return "not lowerable: an earlier `$name` takes the first numbers of its local classes"
     }
     return null
   }
 
   /**
+   * Earlier same-named declarations whose inlined content consumes this name's numbers. Each match
+   * calls an in-module inline function whose body carries local-class shapes (see
+   * [hasLocalClassShapes]), following the chain through shapeless inline middles, or reads a
+   * property whose inline accessor body carries them. The shapes are invisible in the declaration
+   * itself, but once inlined at IR time they shift a later same-named kept body. A bodyless
+   * (library) inline callee ends nothing unless it is reified or an accessor: reified operations
+   * regenerate per instantiation at the call site, and inline accessors inline there too.
+   *
+   * A candidate with no numbering needs of its own — no local classes (see [hasOwnLocalClasses])
+   * and no transitive chains through in-module inline callees — emits no local classes, so a
+   * purely-direct earlier donor (one that calls no in-module shaped body itself) cannot shift it:
+   * such donors are dropped from the scan. (A same-named non-inline donor's own classes are its
+   * implementation detail; they never inline into the candidate.) Donors with transitive content
+   * still lower real: the reservation keeps inlined-lambda marker numbering exact.
+   */
+  fun transitiveNumberingDonors(function: FirFunction): NumberingDonorScan {
+    val name = (function.symbol as? FirNamedFunctionSymbol)?.name ?: return NumberingDonorScan.None
+    val consumerNeedsNumbering =
+        hasOwnLocalClasses(function) || collectNumberingChains(function.body).isNotEmpty()
+    val donors = mutableListOf<TransitiveDonor>()
+    for (declaration in containerDeclarations(function)) {
+      if (declaration === function) break
+      val sameName =
+          when (declaration) {
+            is FirFunction -> (declaration.symbol as? FirNamedFunctionSymbol)?.name == name
+            is FirProperty -> declaration.name == name
+            else -> false
+          }
+      if (!sameName) continue
+      if (declaration is FirFunction && declaration.isInline && isKeepable(declaration)) continue
+      if (declaration is FirFunction) {
+        // An earlier declaration with local-class shapes of its own consumes this name's numbers
+        // just as inlined content does: the donor lowers real either way. The eager check already
+        // rejects the combination when the consumer has classes of its own; without them the
+        // consumer defers here instead of numbering silently from 1.
+        val chains = collectNumberingChains(declaration.body)
+        if (!hasLocalClassShapes(declaration) && chains.isEmpty()) continue
+        val flat = chains.flatten()
+        donors +=
+            TransitiveDonor(
+                donor = declaration,
+                callees = flat.map { it.symbol }.distinct(),
+                terminals = flat.filter { it.body == null }.map { it.symbol }.distinct(),
+                reason =
+                    if (chains.isEmpty()) {
+                      "not lowerable: an earlier `$name` declares local classes, which take " +
+                          "the first numbers"
+                    } else {
+                      "not lowerable: an earlier `$name` inlines " +
+                          chains.joinToString("; ") { chain ->
+                            chain.joinToString(" → ") { it.display }
+                          } +
+                          ", whose local classes take the first numbers"
+                    },
+                donorDesc =
+                    if (
+                        hasMangledMemberReturn(declaration) || hasNestedNamedFunction(declaration)
+                    ) {
+                      null
+                    } else {
+                      jvmDescriptor(declaration)
+                    },
+            )
+        continue
+      }
+      // A same-named property rejects only when it could carry numbering content: its delegate,
+      // initializer or accessors hold local-class shapes (or did before emptying, via the
+      // emptied-body marker). A provably-shapeless declaration (e.g. `const val compute = 1`)
+      // consumes no numbers. Same-container properties are always local, so their bodies or
+      // markers are visible here.
+      if (
+          declaration is FirProperty && hasLocalClassShapes(declaration) && consumerNeedsNumbering
+      ) {
+        return NumberingDonorScan.Unmappable(
+            "not lowerable: an earlier `$name` is not a function, so its inlined content " +
+                "cannot be reconstructed",
+        )
+      }
+    }
+    if (!consumerNeedsNumbering && donors.all { it.callees.isEmpty() }) {
+      // A candidate that emits no local classes needs no reservation: purely-direct donors'
+      // classes never reach it.
+      return NumberingDonorScan.None
+    }
+    return NumberingDonorScan.Found(donors)
+  }
+
+  /** The numbering-donor scan for one kept function: none, found, or never reconstructible. */
+  sealed interface NumberingDonorScan {
+    data object None : NumberingDonorScan
+
+    data class Found(val donors: List<TransitiveDonor>) : NumberingDonorScan
+
+    data class Unmappable(val reason: String) : NumberingDonorScan
+  }
+
+  /** An earlier same-named declaration calling inlinable bodies, with its consumer. */
+  data class TransitiveDonor(
+      /** The earlier declaration whose IR-time inlined content consumes the name's numbers. */
+      val donor: FirFunction,
+      /**
+       * Every inline symbol on the consumption paths, direct first: the chains from the donor to
+       * each shaped body. All must be kept for the content to be reconstructed.
+       */
+      val callees: List<FirCallableSymbol<*>>,
+      /**
+       * The bodyless symbols among [callees] (library reified functions, library inline accessors,
+       * and bodyless callees with crossinline or suspend parameters such as `Sequence { }`): their
+       * content regenerates from the library at the call site in every compilation, so the restore
+       * gate does not require them kept.
+       */
+      val terminals: List<FirCallableSymbol<*>>,
+      /** The keep-rejection text if the content cannot be reconstructed. */
+      val reason: String,
+      /**
+       * The donor's JVM method descriptor, or null when it cannot be established exactly:
+       * unmappable signature shapes (context receivers, type variables, literal types, local
+       * classes, non-null value classes, suspend-function types), name-mangling parameter or
+       * member-return types (unsigned and value classes, nullable or not), or a named local
+       * function declared in the donor body (its private static helper cannot be named exactly).
+       * Null reconstructs nothing: the consumer is rejected instead.
+       */
+      val donorDesc: String?,
+  )
+
+  /** One inline step on a consumption path: the symbol that must be kept, with its body. */
+  private data class InlineCallee(
+      val symbol: FirCallableSymbol<*>,
+      val body: FirElement?,
+      val display: String,
+  )
+
+  /**
+   * Every chain of in-module inline callees from [body] to a shaped body, direct first. A call to
+   * an inline function with shapes ends the chain; a shapeless inline callee continues through its
+   * body (it inlines into the donor, and the shaped body behind it inlines further). A reified
+   * library callee, or a library inline accessor, with no FIR body here ends the chain as a
+   * terminal entry: it regenerates at the call site. Reads of properties with shaped inline
+   * accessors match the same way. Non-inline and non-reified body-less function callees end
+   * nothing: their classes are numbered where they are declared, not at the call site. Each direct
+   * callee is followed with a fresh visited set, so chains that share a callee behind different
+   * middles are each recorded.
+   */
+  private fun collectNumberingChains(body: FirElement?): List<List<InlineCallee>> {
+    if (body == null) return emptyList()
+    val roots = mutableListOf<InlineCallee>()
+    body.accept(
+        object : FirVisitorVoid() {
+          override fun visitElement(element: FirElement) {
+            roots += inlineCallees(element)
+            element.acceptChildren(this)
+          }
+        },
+    )
+    return roots
+        .flatMap { followNumberingChain(it, emptyList(), HashSet<FirCallableSymbol<*>>()) }
+        .distinct()
+  }
+
+  private fun followNumberingChain(
+      callee: InlineCallee,
+      chain: List<InlineCallee>,
+      visited: Set<FirCallableSymbol<*>>,
+  ): List<List<InlineCallee>> {
+    if (callee.symbol in visited) return emptyList()
+    val next = chain + callee
+    if (callee.body == null) return listOf(next)
+    if (hasLocalClassShapes(callee.body)) return listOf(next)
+    val found = mutableListOf<List<InlineCallee>>()
+    callee.body.accept(
+        object : FirVisitorVoid() {
+          override fun visitElement(element: FirElement) {
+            for (nested in inlineCallees(element)) {
+              found += followNumberingChain(nested, next, visited + callee.symbol)
+            }
+            element.acceptChildren(this)
+          }
+        },
+    )
+    return found
+  }
+
+  /**
+   * The in-module inline callees of one expression: called functions, and the inline accessors of
+   * read or written properties. Each carries the body that inlines and the name the rejection
+   * reports.
+   */
+  private fun inlineCallees(element: FirElement): List<InlineCallee> {
+    if (element is FirFunctionCall) {
+      val callee =
+          (element.calleeReference as? FirResolvedNamedReference)?.resolvedSymbol
+              as? FirNamedFunctionSymbol ?: return emptyList()
+      val fir = callee.fir as? FirFunction ?: return emptyList()
+      if (!fir.isInline) return emptyList()
+      val body = fir.body
+      if (body == null) {
+        // A bodyless (library) inline callee regenerates nothing unless it is reified or it must
+        // defer a lambda: a reified operation regenerates per instantiation at the call site, while
+        // a crossinline or suspend parameter is boxed into a call-site class (e.g. stdlib
+        // `Sequence { }` wraps its iterator in an anonymous object), consuming its numbers.
+        val regenerates =
+            fir.typeParameters.any { it.symbol.fir.isReified } ||
+                fir.valueParameters.any { param ->
+                  param.isCrossinline ||
+                      (param.returnTypeRef.coneTypeOrNull as? ConeClassLikeType)
+                          ?.lookupTag
+                          ?.classId
+                          ?.shortClassName
+                          ?.asString()
+                          ?.startsWith("SuspendFunction") == true
+                }
+        if (!regenerates) return emptyList()
+        return listOf(InlineCallee(callee, null, "`${callee.callableId}`"))
+      }
+      return listOf(InlineCallee(callee, body, "`${callee.callableId}`"))
+    }
+    if (element is FirPropertyAccessExpression) {
+      val property =
+          (element.calleeReference as? FirResolvedNamedReference)?.resolvedSymbol
+              as? FirPropertySymbol ?: return emptyList()
+      val prop = property.callableId?.toString() ?: return emptyList()
+      return listOfNotNull(property.getterSymbol, property.setterSymbol).mapNotNull { accessor ->
+        val fir = accessor.fir as? FirPropertyAccessor ?: return@mapNotNull null
+        if (!fir.isInline) return@mapNotNull null
+        val display = "`$prop${if (accessor === property.getterSymbol) ".get" else ".set"}`"
+        val body = fir.body
+        if (body == null) {
+          // A bodyless (library) inline accessor regenerates at the call site like a reified
+          // terminal: record it; the restore gate exempts it the same way.
+          return@mapNotNull InlineCallee(accessor, null, display)
+        }
+        InlineCallee(accessor, body, display)
+      }
+    }
+    return emptyList()
+  }
+
+  /**
+   * The JVM method descriptor for [function]'s erased signature, or null when it cannot be
+   * established exactly. The extension receiver, if any, leads the parameters, as the backend
+   * passes it; a suspend function gains the trailing continuation parameter the backend adds.
+   * Nullable primitives box; most classes map by package. No descriptor form exists for context
+   * parameters, type variables, literal types, local classes, non-null value classes and
+   * suspend-function types: all fall back to null (fail closed). Unsigned and value-class
+   * parameters are rejected before mapping (see [hasMangledParamType]).
+   */
+  private fun jvmDescriptor(function: FirFunction): String? {
+    // Context parameters are not mapped: fail closed until their order is proven.
+    if (function.contextParameters.isNotEmpty()) return null
+    // An unsigned or value-class parameter mangles the JVM name with an unpredictable hash.
+    if (hasMangledParamType(function)) return null
+    val receivers =
+        function.receiverParameter?.let {
+          listOf(it.typeRef.coneTypeOrNull?.let(::jvmTypeDescriptor) ?: return null)
+        } ?: emptyList()
+    val params =
+        function.valueParameters.map { param ->
+          val typeRef = param.returnTypeRef.coneTypeOrNull ?: return null
+          if (!param.isVararg) {
+            jvmTypeDescriptor(typeRef) ?: return null
+          } else {
+            // A vararg erases to an array of the component's erased type: primitives stay
+            // primitive, unlike the boxed components of a generic `Array`. FIR stores a
+            // primitive vararg directly as its primitive array (`vararg xs: Int` is `IntArray`,
+            // seen in the ABI compile itself) and any other vararg in the wrapped `Array<out T>`
+            // form, whose `out` projection marks the component.
+            val normalized =
+                when (typeRef) {
+                  is ConeFlexibleType -> typeRef.lowerBound
+                  is ConeDefinitelyNotNullType -> typeRef.original
+                  else -> typeRef
+                }
+            val arrayType =
+                (normalized as? ConeClassLikeType)?.takeIf {
+                  it.lookupTag.classId.shortClassName.asString() == "Array"
+                }
+            if (arrayType != null) {
+              val arrayArg =
+                  arrayType.typeArguments.singleOrNull() as? ConeKotlinTypeProjection ?: return null
+              // Only an `out` projection is the wrapped form; an invariant `Array` is the
+              // element itself (possibly an array, which boxes its own components). Wrapped
+              // components erase in generic-argument mode (`vararg Array<UIntArray>` is
+              // `UIntArray[]`, ground truth by javap).
+              if (arrayArg.kind == ProjectionKind.OUT) {
+                "[" + (jvmTypeDescriptorInner(arrayArg.type, false, true, true) ?: return null)
+              } else {
+                "[" + (jvmTypeDescriptor(normalized) ?: return null)
+              }
+            } else {
+              // Already an array (`IntArray` and friends): its descriptor is exact as is.
+              jvmTypeDescriptor(normalized) ?: return null
+            }
+          }
+        }
+    // A suspend function returns `Object` at the JVM level however it is declared.
+    val returns =
+        if (function.isSuspend) {
+          "Ljava/lang/Object;"
+        } else {
+          function.returnTypeRef.coneTypeOrNull?.let { jvmTypeDescriptor(it, isReturn = true) }
+              ?: return null
+        }
+    val suspension = if (function.isSuspend) "Lkotlin/coroutines/Continuation;" else ""
+    return (receivers + params).joinToString(
+        separator = "",
+        prefix = "(",
+        postfix = "$suspension)$returns",
+    )
+  }
+
+  /**
+   * Whether any value parameter (or the receiver, which the backend passes first) would mangle the
+   * JVM name: unsigned and value-class parameter types gain an unpredictable hash suffix, so no
+   * stub key can name them. Member value-class returns mangle too; see [hasMangledMemberReturn].
+   */
+  private fun hasMangledParamType(function: FirFunction): Boolean {
+    val params =
+        listOfNotNull(function.receiverParameter?.typeRef?.coneTypeOrNull) +
+            function.valueParameters.mapNotNull { it.returnTypeRef.coneTypeOrNull }
+    return params.any(::isMangledParamType)
+  }
+
+  private fun isMangledParamType(type: ConeKotlinType): Boolean =
+      when (type) {
+        is ConeFlexibleType -> isMangledParamType(type.lowerBound)
+        is ConeDefinitelyNotNullType -> isMangledParamType(type.original)
+        is ConeClassLikeType -> {
+          // Nullable or not: an unsigned or value-class parameter mangles the JVM name with an
+          // unpredictable hash (`a1-ExVfyTY(kotlin.UInt)`, ground truth by javap), so no stub key
+          // can name it. A direct unsigned-array parameter keeps its plain name
+          // (`ua(kotlin.UIntArray[])`), so unsigned arrays never flag parameters.
+          val classId = type.lookupTag.classId
+          if (
+              classId.packageFqName.asString() == "kotlin" &&
+                  classId.shortClassName.asString() in UNSIGNED_ARRAYS
+          ) {
+            return false
+          }
+          isMangledClassifier(classId)
+        }
+        else -> false
+      }
+
+  /**
+   * Whether [classId] can mangle a JVM name: unsigned types, unsigned arrays and value classes do,
+   * nullable or not (`a1-ExVfyTY`, `a2-v1W5SeY`, member `ta-g_c56RQ`, all ground truth by javap).
+   * Value classes mangle from any package: user value classes behave exactly like `kotlin.UInt`, so
+   * the inline-or-value check runs before the `kotlin` package gate.
+   */
+  private fun isMangledClassifier(classId: ClassId): Boolean {
+    if (isInlineOrValueClass(classId)) return true
+    if (classId.packageFqName.asString() != "kotlin") return false
+    val short = classId.shortClassName.asString()
+    return short in UNSIGNED || short in UNSIGNED_ARRAYS
+  }
+
+  /**
+   * Whether [function]'s declared return type mangles a MEMBER's JVM name. Top-level functions
+   * never mangle for the return type (`f1`, `f2` plain by javap); members do (`t1-OGnWXxg`,
+   * `t2-gbq4QnA`, `t3-hIQOoDM`, `t4-iAqF9CU`, `ta-g_c56RQ`). Only the top-level classifier counts
+   * (`List<UInt>` member returns stay plain).
+   */
+  private fun hasMangledMemberReturn(function: FirFunction): Boolean {
+    if (function.symbol.callableId?.classId == null) return false
+    val returnType = function.returnTypeRef.coneTypeOrNull ?: return false
+    val normalized =
+        when (returnType) {
+          is ConeFlexibleType -> returnType.lowerBound
+          is ConeDefinitelyNotNullType -> returnType.original
+          else -> returnType
+        }
+    val classId = (normalized as? ConeClassLikeType)?.lookupTag?.classId ?: return false
+    return isMangledClassifier(classId)
+  }
+
+  /**
+   * Whether [function]'s body declares a named local function: it compiles to a private static
+   * helper (`nested$inner`, ground truth by javap) that the stubber cannot name exactly, so such
+   * donors fail closed. Lambdas and anonymous objects generate numbered classes instead, which the
+   * numbering side effect reproduces exactly.
+   */
+  private fun hasNestedNamedFunction(function: FirFunction): Boolean {
+    val body = function.body ?: return false
+    var found = false
+    body.accept(
+        object : FirVisitorVoid() {
+          override fun visitElement(element: FirElement) {
+            if (found) return
+            if (element is FirFunction && element !is FirAnonymousFunction) {
+              found = true
+              return
+            }
+            element.acceptChildren(this)
+          }
+        },
+    )
+    return found
+  }
+
+  private val UNSIGNED = setOf("UByte", "UShort", "UInt", "ULong")
+
+  private val UNSIGNED_ARRAYS = setOf("UByteArray", "UShortArray", "UIntArray", "ULongArray")
+
+  private fun jvmTypeDescriptor(type: ConeKotlinType, isReturn: Boolean = false): String? =
+      jvmTypeDescriptorInner(type, isReturn, type.isMarkedNullable, false)
+
+  private fun jvmTypeDescriptorInner(
+      type: ConeKotlinType,
+      isReturn: Boolean,
+      nullable: Boolean,
+      isArrayComponent: Boolean,
+  ): String? =
+      when (type) {
+        is ConeFlexibleType ->
+            jvmTypeDescriptorInner(type.lowerBound, isReturn, nullable, isArrayComponent)
+        is ConeDefinitelyNotNullType ->
+            jvmTypeDescriptorInner(type.original, isReturn, false, isArrayComponent)
+        is ConeErrorType -> null
+        is ConeClassLikeType -> {
+          val classId = type.lookupTag.classId
+          if (classId.isLocal) return null
+          val short = classId.shortClassName.asString()
+          // Suspend-function values erase by lowering context, not by name.
+          if (short.startsWith("SuspendFunction")) return null
+          jdkDescriptor(classId)?.let {
+            return it
+          }
+          when (classId.packageFqName.asString()) {
+            "kotlin" -> kotlinDescriptor(classId, short, type, isReturn, nullable, isArrayComponent)
+            "kotlin.collections" -> kotlinCollectionsDescriptor(classId, short)
+            else -> {
+              if (isInlineOrValueClass(classId)) {
+                // A nullable value class erases to its box, which names it exactly; the
+                // underlying type of a non-null one cannot be named here.
+                if (!nullable) return null
+              }
+              val pkg = classId.packageFqName.asString()
+              val pkgPrefix = if (pkg.isEmpty()) "" else pkg.replace('.', '/') + "/"
+              "L$pkgPrefix${classId.relativeClassName.asString().replace('.', '$')};"
+            }
+          }
+        }
+        else -> null
+      }
+
+  /**
+   * JVM descriptors for the classes the backend maps to the JDK, across the `kotlin` packages that
+   * declare them. Collection interfaces live in `kotlin.collections`, the rest in `kotlin`;
+   * anything else keeps its Kotlin class. A user class that happens to share a short name is never
+   * mapped: the package must match too.
+   */
+  private fun jdkDescriptor(classId: ClassId): String? {
+    val pkg = classId.packageFqName.asString()
+    val short = classId.shortClassName.asString()
+    val relative = classId.relativeClassName.asString()
+    if (
+        (pkg == "kotlin" || pkg == "kotlin.collections") &&
+            (relative == "Map.Entry" || relative == "MutableMap.MutableEntry")
+    ) {
+      return "Ljava/util/Map\$Entry;"
+    }
+    if (pkg == "kotlin" || pkg == "kotlin.collections") {
+      when (short) {
+        "Collection",
+        "MutableCollection" -> return "Ljava/util/Collection;"
+        "List",
+        "MutableList" -> return "Ljava/util/List;"
+        "Set",
+        "MutableSet" -> return "Ljava/util/Set;"
+        "Map",
+        "MutableMap" -> return "Ljava/util/Map;"
+        "Iterable",
+        "MutableIterable" -> return "Ljava/lang/Iterable;"
+        "Iterator",
+        "MutableIterator" -> return "Ljava/util/Iterator;"
+        "ListIterator",
+        "MutableListIterator" -> return "Ljava/util/ListIterator;"
+      }
+    }
+    if (pkg == "kotlin.text" && (short == "StringBuilder" || short == "Appendable")) {
+      return if (short == "StringBuilder") "Ljava/lang/StringBuilder;" else "Ljava/lang/Appendable;"
+    }
+    // Expect/actual classes FIR keeps unexpanded: `Cloneable` and `Int.Companion` (all ground
+    // truth by javap). Other companions (`String.Companion`, ...) stay unmapped and fail closed
+    // downstream.
+    if (pkg == "kotlin" && relative == "Int.Companion") {
+      return "Lkotlin/jvm/internal/IntCompanionObject;"
+    }
+    if (pkg == "kotlin.concurrent.atomics" && short == "AtomicInt") {
+      return "Ljava/util/concurrent/atomic/AtomicInteger;"
+    }
+    if (pkg != "kotlin") return null
+    return when (short) {
+      "Any" -> "Ljava/lang/Object;"
+      "String" -> "Ljava/lang/String;"
+      "CharSequence" -> "Ljava/lang/CharSequence;"
+      "Cloneable" -> "Ljava/lang/Cloneable;"
+      "Comparable" -> "Ljava/lang/Comparable;"
+      "Comparator" -> "Ljava/util/Comparator;"
+      "Number" -> "Ljava/lang/Number;"
+      "Enum" -> "Ljava/lang/Enum;"
+      "Annotation" -> "Ljava/lang/annotation/Annotation;"
+      "Throwable" -> "Ljava/lang/Throwable;"
+      "Exception" -> "Ljava/lang/Exception;"
+      "RuntimeException" -> "Ljava/lang/RuntimeException;"
+      "Error" -> "Ljava/lang/Error;"
+      "Appendable" -> "Ljava/lang/Appendable;"
+      "Nothing" -> "Ljava/lang/Void;"
+      else -> null
+    }
+  }
+
+  /**
+   * JVM descriptors for the `kotlin` package: primitives (boxed when nullable), arrays, the
+   * function interfaces, and the classes the backend maps to the JDK. Anything else is a genuine
+   * Kotlin class. `Unit?` stays an object reference; only a non-null `Unit` return is void.
+   */
+  private fun kotlinDescriptor(
+      classId: ClassId,
+      short: String,
+      type: ConeClassLikeType,
+      isReturn: Boolean,
+      nullable: Boolean,
+      isArrayComponent: Boolean,
+  ): String? {
+    if (short.startsWith("Function")) {
+      return if (short.removePrefix("Function").toIntOrNull() in 0..22) {
+        "Lkotlin/jvm/functions/$short;"
+      } else {
+        null
+      }
+    }
+    if (!nullable) {
+      when (short) {
+        "Boolean" -> return "Z"
+        "Byte" -> return "B"
+        "Char" -> return "C"
+        "Double" -> return "D"
+        "Float" -> return "F"
+        "Int" -> return "I"
+        "Long" -> return "J"
+        "Short" -> return "S"
+        "Unit" -> return if (isReturn) "V" else "Lkotlin/Unit;"
+        "UByte" -> return "B"
+        "UShort" -> return "S"
+        "UInt" -> return "I"
+        "ULong" -> return "J"
+      }
+    } else {
+      when (short) {
+        "Boolean" -> return "Ljava/lang/Boolean;"
+        "Byte" -> return "Ljava/lang/Byte;"
+        "Char" -> return "Ljava/lang/Character;"
+        "Double" -> return "Ljava/lang/Double;"
+        "Float" -> return "Ljava/lang/Float;"
+        "Int" -> return "Ljava/lang/Integer;"
+        "Long" -> return "Ljava/lang/Long;"
+        "Short" -> return "Ljava/lang/Short;"
+        "UByte" -> return "Lkotlin/UByte;"
+        "UShort" -> return "Lkotlin/UShort;"
+        "UInt" -> return "Lkotlin/UInt;"
+        "ULong" -> return "Lkotlin/ULong;"
+        "Unit" -> return "Lkotlin/Unit;"
+      }
+    }
+    if (short == "Array") {
+      val argument = type.typeArguments.singleOrNull() ?: return null
+      // Erasure keeps `out` components, but an `in` projection or a star erases to `Object`:
+      // `Array<in String>` is `Object[]` while `Array<out Int>` is `Integer[]`.
+      if (
+          argument is ConeStarProjection ||
+              (argument as? ConeKotlinTypeProjection)?.kind == ProjectionKind.IN
+      ) {
+        return "[Ljava/lang/Object;"
+      }
+      val component = (argument as? ConeKotlinTypeProjection)?.type ?: return null
+      // A generic `Array` boxes its components (`Array<Int>` is `Integer[]`, `Array<UInt>` is
+      // `UInt[]`); unsigned arrays stay classes (`Array<UIntArray>` is `UIntArray[]`).
+      return "[" + (jvmTypeDescriptorInner(component, false, true, true) ?: return null)
+    }
+    when (short) {
+      "BooleanArray" -> return "[Z"
+      "ByteArray" -> return "[B"
+      "CharArray" -> return "[C"
+      "DoubleArray" -> return "[D"
+      "FloatArray" -> return "[F"
+      "IntArray" -> return "[I"
+      "LongArray" -> return "[J"
+      "ShortArray" -> return "[S"
+      // In a generic component position unsigned arrays stay classes (`Array<UIntArray>` is
+      // `UIntArray[]`); directly they erase to primitive arrays (`UIntArray` is `int[]`).
+      "UByteArray" -> return if (isArrayComponent) "Lkotlin/UByteArray;" else "[B"
+      "UShortArray" -> return if (isArrayComponent) "Lkotlin/UShortArray;" else "[S"
+      "UIntArray" -> return if (isArrayComponent) "Lkotlin/UIntArray;" else "[I"
+      "ULongArray" -> return if (isArrayComponent) "Lkotlin/ULongArray;" else "[J"
+    }
+    if (isInlineOrValueClass(classId)) return null
+    return "Lkotlin/${classId.relativeClassName.asString().replace('.', '$')};"
+  }
+
+  /** The `kotlin.collections` classes the backend maps to the JDK; the rest stay Kotlin classes. */
+  private fun kotlinCollectionsDescriptor(classId: ClassId, short: String): String =
+      when (short) {
+        "ArrayList" -> "Ljava/util/ArrayList;"
+        "HashMap" -> "Ljava/util/HashMap;"
+        "HashSet" -> "Ljava/util/HashSet;"
+        "LinkedHashMap" -> "Ljava/util/LinkedHashMap;"
+        "LinkedHashSet" -> "Ljava/util/LinkedHashSet;"
+        else -> "Lkotlin/collections/${classId.relativeClassName.asString().replace('.', '$')};"
+      }
+
+  private fun isInlineOrValueClass(classId: ClassId): Boolean {
+    val fir = session.symbolProvider.getClassLikeSymbolByClassId(classId)?.fir
+    return fir is FirRegularClass && fir.isInlineOrValue
+  }
+
+  /**
    * Whether the compiled [function] has numbered classes of its own: anonymous objects, callable
-   * references, local classes, and lambdas that are not inlined. A lambda passed to a parameter of
-   * an inline function that is not `noinline` is inlined into the body and gets no class. It still
-   * takes a number (see [hasLocalClassShapes]), but the number shows only in the debug name of its
-   * marker variable (`$i$a$-all-Outer$name$2`), so it is not counted here.
+   * references, local classes, lambdas that are not inlined, and declarations whose emptied body
+   * had local classes. A lambda passed to a parameter of an inline function that is not `noinline`
+   * is inlined into the body and gets no class. It still takes a number (see
+   * [hasLocalClassShapes]), but the number shows only in the debug name of its marker variable
+   * (`$i$a$-all-Outer$name$2`), so it is not counted here.
    */
   private fun hasOwnLocalClasses(function: FirFunction): Boolean {
     val inlinedLambdas = HashSet<FirAnonymousFunction>()

@@ -677,6 +677,8 @@ class K2JvmAbiFirAnalysisHandlerExtension(
     // Write bytecode from generationState.factory to disk.
     // Apply bytecode post-processing (see BytecodeSanitizerStage) in-memory before writing to
     // avoid a separate read-back pass.
+    // Numbering donors lowered real for their side effect; stub them now that codegen ran.
+    pipeline.bytecodeSanitizer.numberingDonors = pipeline.inlineBodies.numberingDonorMethods
     val outputFiles =
         result.classFileFactoryCompat.asList().map { outputFile ->
           val originalBytes = outputFile.asByteArray()
@@ -688,6 +690,17 @@ class K2JvmAbiFirAnalysisHandlerExtension(
               }
           AbiValidationOutputFile(outputFile.relativePath, bytes)
         }
+    // Every recorded donor must have been stubbed: an unstubbed donor ships its real body, and a
+    // kept body behind it may be misnumbered. Fail the compilation instead of shipping it.
+    for (unmatched in pipeline.bytecodeSanitizer.unmatchedDonors()) {
+      messageCollector.report(
+          CompilerMessageSeverity.ERROR,
+          "Kosabi inline bodies: the numbering donor `${unmatched.owner}.${unmatched.name}" +
+              "${unmatched.desc}` was not stubbed post-codegen: its method is missing from the " +
+              "bytecode. Remove `inline`, make the function private, or change its body; or set " +
+              "abi_generation_mode = \"class\".",
+      )
+    }
     val outputDir = configuration[JVMConfigurationKeys.OUTPUT_DIRECTORY]
     if (outputDir != null) {
       outputFiles.forEach { outputFile ->

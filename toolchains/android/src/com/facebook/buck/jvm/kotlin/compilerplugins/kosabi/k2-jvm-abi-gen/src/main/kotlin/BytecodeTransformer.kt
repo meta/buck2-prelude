@@ -388,6 +388,63 @@ class SuspendInlineDispatchStubber : BytecodeTransformer {
 }
 
 /**
+ * A kept inline-body numbering donor to stub post-codegen, identified by the internal name of its
+ * owner class and its JVM name and descriptor.
+ */
+data class DonorMethod(val owner: String, val name: String, val desc: String)
+
+/**
+ * Stubs the methods InlineBodyStage lowered real for their numbering side effect.
+ *
+ * A kept body behind a same-named donor numbers its local classes as in a full compile only when
+ * the donor's inlined content lowers with it. The donor method itself must not ship: it is not a
+ * kept inline body, so it is replaced with `aconst_null; athrow` exactly as a class ABI stubs a
+ * non-ABI method. An empty donor set leaves every class unchanged.
+ */
+class NumberingDonorStubber : BytecodeTransformer {
+  var donors: Set<DonorMethod> = emptySet()
+
+  private val consumed = HashSet<DonorMethod>()
+
+  /** Recorded donors no class file matched: their real bodies would ship silently. */
+  fun unmatched(): Set<DonorMethod> = donors - consumed
+
+  override fun transform(bytes: ByteArray): ByteArray? {
+    if (donors.isEmpty()) {
+      return null
+    }
+    val node = ClassNode()
+    ClassReader(bytes).accept(node, 0)
+    var stubbed = false
+    for (method in node.methods) {
+      if (DonorMethod(node.name, method.name, method.desc) !in donors) {
+        continue
+      }
+      consumed += DonorMethod(node.name, method.name, method.desc)
+      val static = method.access and Opcodes.ACC_STATIC != 0
+      method.instructions =
+          InsnList().apply {
+            add(InsnNode(Opcodes.ACONST_NULL))
+            add(InsnNode(Opcodes.ATHROW))
+          }
+      method.tryCatchBlocks = mutableListOf()
+      method.localVariables = null
+      method.visibleLocalVariableAnnotations = null
+      method.invisibleLocalVariableAnnotations = null
+      method.maxStack = 1
+      method.maxLocals = (Type.getArgumentsAndReturnSizes(method.desc) shr 2) - if (static) 1 else 0
+      stubbed = true
+    }
+    if (!stubbed) {
+      return null
+    }
+    val writer = ClassWriter(0)
+    node.accept(writer)
+    return writer.toByteArray()
+  }
+}
+
+/**
  * Strips LineNumberTable entries from the method bodies that no consumer inlines.
  *
  * Consumers read the method bodies of an ABI jar only to inline them. The line numbers of the other

@@ -30,6 +30,7 @@ import org.jetbrains.kotlin.backend.common.extensions.IrPluginContext
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.config.KotlinCompilerVersion
+import org.jetbrains.kotlin.descriptors.Visibilities
 import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.backend.Fir2IrComponentsStorage
 import org.jetbrains.kotlin.fir.backend.Fir2IrConfiguration
@@ -39,16 +40,23 @@ import org.jetbrains.kotlin.fir.backend.Fir2IrPluginContext
 import org.jetbrains.kotlin.fir.backend.Fir2IrVisitor
 import org.jetbrains.kotlin.fir.backend.FirMetadataSource
 import org.jetbrains.kotlin.fir.declarations.FirDeclaration
+import org.jetbrains.kotlin.fir.declarations.FirFile
 import org.jetbrains.kotlin.fir.declarations.FirFunction
+import org.jetbrains.kotlin.fir.declarations.FirMemberDeclaration
 import org.jetbrains.kotlin.fir.declarations.FirProperty
 import org.jetbrains.kotlin.fir.declarations.FirPropertyAccessor
 import org.jetbrains.kotlin.fir.declarations.FirRegularClass
+import org.jetbrains.kotlin.fir.expressions.FirAnnotation
 import org.jetbrains.kotlin.fir.expressions.FirBlock
 import org.jetbrains.kotlin.fir.expressions.FirExpression
 import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
+import org.jetbrains.kotlin.fir.expressions.FirLiteralExpression
 import org.jetbrains.kotlin.fir.references.FirNamedReference
+import org.jetbrains.kotlin.fir.symbols.impl.FirNamedFunctionSymbol
 import org.jetbrains.kotlin.fir.symbols.impl.FirPropertyAccessorSymbol
+import org.jetbrains.kotlin.fir.types.ConeClassLikeType
 import org.jetbrains.kotlin.fir.types.ConeKotlinType
+import org.jetbrains.kotlin.fir.types.FirResolvedTypeRef
 import org.jetbrains.kotlin.fir.types.coneType
 import org.jetbrains.kotlin.fir.visitors.FirVisitorVoid
 import org.jetbrains.kotlin.ir.IrElement
@@ -91,6 +99,29 @@ internal class InlineBodyStage : AbiGenStage {
   val restoredIrFunctions: MutableSet<IrSimpleFunction> =
       Collections.newSetFromMap(IdentityHashMap())
 
+  /**
+   * Kept functions deferred on numbering donors: each kept body restores only once all of its
+   * donors have converted for the numbering side effect. Keyed by the kept function.
+   */
+  private val numberingDonors =
+      IdentityHashMap<FirFunction, List<InlineBodyKeepability.TransitiveDonor>>()
+
+  /** Each donor declaration with the (kept function, keep-rejection) pairs waiting on it. */
+  private val donorConsumers =
+      IdentityHashMap<FirFunction, MutableList<Pair<FirFunction, String>>>()
+
+  /** Whether each visited donor converted cleanly. Absent until the donor's own visit. */
+  private val donorConverted = IdentityHashMap<FirFunction, Boolean>()
+
+  /** Each donor declaration with its exact post-codegen identity for the stubber. */
+  private val donorMethods = IdentityHashMap<FirFunction, DonorMethod>()
+
+  /**
+   * Donor methods to stub post-codegen: real through codegen for the numbering side effect, then
+   * replaced with throwing stubs. Read by the bytecode sanitizer.
+   */
+  val numberingDonorMethods = LinkedHashSet<DonorMethod>()
+
   /** Runs the rule on every own source file. Must run before any FIR cleanup. */
   fun decide(
       analysisResults: FrontendOutputCompat,
@@ -114,7 +145,39 @@ internal class InlineBodyStage : AbiGenStage {
         forEachFunction(firFile.declarations) {
           when {
             !rule.isCandidate(it) -> {}
-            rule.isKeepable(it) -> keptFirFunctions += it
+            rule.isKeepable(it) -> {
+              when (val scan = rule.transitiveNumberingDonors(it)) {
+                is InlineBodyKeepability.NumberingDonorScan.None -> keptFirFunctions += it
+                is InlineBodyKeepability.NumberingDonorScan.Unmappable ->
+                    skipBody(messageCollector, functionDisplayName(it), scan.reason)
+                is InlineBodyKeepability.NumberingDonorScan.Found -> {
+                  val methods =
+                      scan.donors.mapNotNull { donor ->
+                        donorMethod(donor, firFile)?.let { donor to it }
+                      }
+                  if (methods.size != scan.donors.size) {
+                    // A donor without an exact descriptor, owner or JVM name cannot be stubbed
+                    // post-codegen: nothing can be reconstructed, so the consumer is rejected
+                    // now, with the failing donor's own reason (not the first donor's).
+                    val resolved = methods.mapTo(HashSet()) { it.first }
+                    val culprit = scan.donors.firstOrNull { it !in resolved } ?: scan.donors.first()
+                    skipBody(
+                        messageCollector,
+                        functionDisplayName(it),
+                        culprit.reason,
+                    )
+                  } else {
+                    keptFirFunctions += it
+                    numberingDonors[it] = scan.donors
+                    for ((donor, method) in methods) {
+                      donorMethods[donor.donor] = method
+                      val waiting = donorConsumers.getOrPut(donor.donor) { mutableListOf() }
+                      waiting += it to donor.reason
+                    }
+                  }
+                }
+              }
+            }
             else ->
                 skipBody(
                     messageCollector,
@@ -246,7 +309,32 @@ internal class InlineBodyStage : AbiGenStage {
       messageCollector: MessageCollector,
   ) {
     val firFunction = firFunctionOf(function) ?: return
+    // A numbering donor converts at its own visit, before any consumer needs its side effect.
+    if (convertNumberingDonor(function, firFunction, pluginContext, messageCollector)) return
     if (firFunction !in keptFirFunctions) return
+    // A deferred consumer restores only once all of its donors converted cleanly behind kept
+    // callees: every in-module symbol on every consumption path must be present for the IR-time
+    // inlining to reproduce the full compilation's numbering (library reified terminals regenerate
+    // from the dependency in every compilation, so they need no keeping).
+    numberingDonors[firFunction]?.let { donors ->
+      fun isDonorReady(donor: InlineBodyKeepability.TransitiveDonor): Boolean =
+          donorConverted[donor.donor] == true &&
+              donor.callees.all { callee ->
+                donor.terminals.any { it === callee } ||
+                    keptFirFunctions.any { it.symbol === callee }
+              }
+      if (!donors.all(::isDonorReady)) {
+        if (firFunction in keptFirFunctions) {
+          keptFirFunctions -= firFunction
+          skipBody(
+              messageCollector,
+              functionDisplayName(firFunction),
+              (donors.firstOrNull { !isDonorReady(it) } ?: donors.first()).reason,
+          )
+        }
+        return
+      }
+    }
     val name = "${firFunction.symbol.callableId}"
     val body =
         try {
@@ -280,6 +368,194 @@ internal class InlineBodyStage : AbiGenStage {
     if (!restoreDefaultValues(pluginContext, function, firFunction, messageCollector, name)) return
     restoredIrFunctions += function
   }
+
+  // Converts a numbering donor for its IR-time side effect: the donor method lowers real so the
+  // kept consumers behind it number their local classes exactly as in a full compile, and the
+  // bytecode sanitizer stubs it post-codegen. Returns true when [firFunction] is a donor. Any
+  // failure strips every waiting consumer with the transitive reason. Donor defaults are not
+  // restored: the stubbed method is discarded.
+  private fun convertNumberingDonor(
+      function: IrSimpleFunction,
+      firFunction: FirFunction,
+      pluginContext: IrPluginContext,
+      messageCollector: MessageCollector,
+  ): Boolean {
+    val consumers = donorConsumers[firFunction] ?: return false
+    val identity = donorMethods[firFunction]
+    if (identity == null) {
+      for ((kept, reason) in consumers) {
+        keptFirFunctions -= kept
+        skipBody(messageCollector, functionDisplayName(kept), reason)
+      }
+      donorConverted[firFunction] = false
+      return true
+    }
+    val body =
+        try {
+          convertBody(pluginContext, function, firFunction)
+        } catch (e: Throwable) {
+          val cause = (e as? InvocationTargetException)?.targetException ?: e
+          if (isKosabiCompilerInternalsFailure(e)) {
+            reportCompilerInternalsFailure(messageCollector, cause)
+            for ((kept, _) in consumers) keptFirFunctions -= kept
+          } else if (e is Exception) {
+            for ((kept, reason) in consumers) {
+              if (keptFirFunctions.remove(kept)) {
+                skipBody(messageCollector, functionDisplayName(kept), reason)
+              }
+            }
+          } else {
+            throw e
+          }
+          donorConverted[firFunction] = false
+          return true
+        }
+    var hasError = false
+    body.acceptChildren(
+        object : IrElementVisitorVoidCompat() {
+          override fun visitElement(element: IrElement) {
+            if (element is IrErrorExpression) hasError = true
+            element.acceptChildren(this, null)
+          }
+        },
+        null,
+    )
+    if (hasError) {
+      for ((kept, reason) in consumers) {
+        if (keptFirFunctions.remove(kept)) {
+          skipBody(messageCollector, functionDisplayName(kept), reason)
+        }
+      }
+      donorConverted[firFunction] = false
+      return true
+    }
+    foldOwnConsts(body)
+    function.body = body
+    restoredIrFunctions += function
+    numberingDonorMethods += identity
+    donorConverted[firFunction] = true
+    return true
+  }
+
+  // The JVM internal name of the class owning [donor]: package segments joined with `/`,
+  // nested classes with `$`. A top-level donor lives in the file facade. Null when it cannot
+  // be established exactly (fail closed: without the owner the donor cannot be stubbed
+  // post-codegen, so its consumers are rejected instead).
+  private fun donorOwnerInternalName(donor: FirFunction, firFile: FirFile): String? {
+    donor.symbol.callableId?.classId?.let { classId ->
+      if (classId.isLocal) return null
+      val pkg = classId.packageFqName.asString()
+      val pkgPrefix = if (pkg.isEmpty()) "" else pkg.replace('.', '/') + "/"
+      return pkgPrefix + classId.relativeClassName.asString().replace('.', '$')
+    }
+    val pkg = firFile.packageDirective.packageFqName.asString()
+    val pkgPrefix = if (pkg.isEmpty()) "" else pkg.replace('.', '/') + "/"
+    return fileFacadeInternalName(firFile)
+  }
+
+  /**
+   * The exact post-codegen identity of [donor] for the stubber, or null when it cannot be
+   * established. Only public donors are reconstructed: private declarations never reach codegen,
+   * and internal JVM names carry module mangling the descriptor cannot name.
+   */
+  private fun donorMethod(
+      donor: InlineBodyKeepability.TransitiveDonor,
+      firFile: FirFile,
+  ): DonorMethod? {
+    val desc = donor.donorDesc ?: return null
+    val (owner, name) = donorMethodIdentity(donor.donor, firFile) ?: return null
+    return DonorMethod(owner, name, desc)
+  }
+
+  private fun donorMethodIdentity(donor: FirFunction, firFile: FirFile): Pair<String, String>? {
+    // Public donors stub by source name. Top-level `internal fun` keeps its source name on JVM
+    // (driver-verified on master: `public static final` with no suffix), so internal donors with
+    // no class owner stub the same way. Internal class/object/companion members mangle and stay
+    // Tier-2, as do private declarations (never reach codegen).
+    val visibility = (donor as? FirMemberDeclaration)?.status?.visibility ?: return null
+    val callableId = donor.symbol.callableId ?: return null
+    if (
+        visibility != Visibilities.Public &&
+            (visibility != Visibilities.Internal || callableId.classId != null)
+    ) {
+      return null
+    }
+    val name = donorJvmName(donor) ?: return null
+    val owner = donorOwnerInternalName(donor, firFile) ?: return null
+    return owner to name
+  }
+
+  // The donor's JVM name: its `@JvmName`, or its source name. The donor is always public or
+  // top-level internal here (see [donorMethodIdentity]), so the source name is exact.
+  // Value-class/unsigned-param donors are excluded via a null descriptor before this runs.
+  private fun donorJvmName(donor: FirFunction): String? {
+    jvmNameAnnotationValue(donor.annotations)?.let {
+      return it
+    }
+    return (donor.symbol as? FirNamedFunctionSymbol)?.name?.asString()
+  }
+
+  // The internal name of the file facade for [firFile]: its `@JvmName` (a dotted name carries its
+  // own package), or the capitalized file stem with `Kt` (non-identifier ASCII characters become
+  // `_`, as the backend sanitizes them; anything exotic fails closed below). A
+  // `@JvmMultifileClass` part is named `<facade>__<File>Kt`; without `@JvmName` there is no exact
+  // part name.
+  private fun fileFacadeInternalName(firFile: FirFile): String? {
+    val pkg = firFile.packageDirective.packageFqName.asString()
+    val pkgPrefix = if (pkg.isEmpty()) "" else pkg.replace('.', '/') + "/"
+    // Backend identifier sanitization, ASCII-only and provably exact: anything else fails
+    // closed. A leading digit or a `$` has no proven mapping either.
+    val raw = firFile.name.substringAfterLast('/').substringBeforeLast('.')
+    if (raw.isEmpty() || raw.first().isDigit() || raw.any { it.code > 127 || it == '$' }) {
+      return null
+    }
+    val stem =
+        raw.map { if (it.isLetterOrDigit() || it == '_') it else '_' }
+            .joinToString("")
+            .replaceFirstChar {
+              it.uppercase()
+            }
+    val jvmName = jvmNameAnnotationValue(firFile.annotations)
+    if (hasJvmAnnotation(firFile.annotations, "JvmMultifileClass")) {
+      val facade = jvmName ?: return null
+      return if ('.' in facade) facade.replace('.', '/') + "__" + stem + "Kt"
+      else pkgPrefix + facade + "__" + stem + "Kt"
+    }
+    if (jvmName != null) {
+      return if ('.' in jvmName) jvmName.replace('.', '/') else pkgPrefix + jvmName
+    }
+    return pkgPrefix + stem + "Kt"
+  }
+
+  private fun jvmNameAnnotationValue(annotations: List<FirAnnotation>): String? {
+    for (annotation in annotations) {
+      val classId =
+          (annotation.annotationTypeRef.coneTypeOrNull as? ConeClassLikeType)?.lookupTag?.classId
+              ?: continue
+      if (
+          classId.packageFqName.asString() == "kotlin.jvm" &&
+              classId.shortClassName.asString() == "JvmName"
+      ) {
+        val name =
+            (annotation.argumentMapping.mapping.values.firstOrNull() as? FirLiteralExpression)
+                ?.value as? String
+        if (name != null) return name
+      }
+    }
+    return null
+  }
+
+  private fun hasJvmAnnotation(annotations: List<FirAnnotation>, short: String): Boolean =
+      annotations.any { annotation ->
+        val classId =
+            (annotation.annotationTypeRef.coneTypeOrNull as? ConeClassLikeType)?.lookupTag?.classId
+                ?: return@any false
+        classId.packageFqName.asString() == "kotlin.jvm" &&
+            classId.shortClassName.asString() == short
+      }
+
+  private val FirElement.coneTypeOrNull: ConeKotlinType?
+    get() = (this as? FirResolvedTypeRef)?.coneType
 
   private fun firFunctionOf(function: IrSimpleFunction): FirFunction? =
       (function.metadata as? FirMetadataSource.Function)?.fir
